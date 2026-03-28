@@ -1,11 +1,21 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
-import { useRouter } from "next/navigation";
-import { Incident, INJURY_TYPE_LABELS } from "@/lib/types";
+import { useEffect, useState, useCallback, use } from "react";
+import {
+  Incident,
+  Severity,
+  InjuryType,
+  INJURY_TYPE_LABELS,
+} from "@/lib/types";
 import { getIncident, updateIncident } from "@/lib/storage";
+import { generateWorkflow } from "@/lib/workflow-engine";
+import { calculateDeadline, isOverdue, isDueSoon } from "@/lib/deadlines";
 import StatusBadge from "@/components/StatusBadge";
+import UndoToast from "@/components/UndoToast";
 
+// ──────────────────────────────────────────────
+// Resource Panel (sidebar)
+// ──────────────────────────────────────────────
 function ResourcePanel() {
   return (
     <div className="bg-white rounded-2xl border border-warm-200 shadow-sm p-6">
@@ -69,14 +79,31 @@ function ResourcePanel() {
   );
 }
 
-function TimingBadge({ timing }: { timing: string }) {
+// ──────────────────────────────────────────────
+// Timing Badge with calculated deadline
+// ──────────────────────────────────────────────
+function TimingBadge({
+  timing,
+  injuryDate,
+}: {
+  timing: string;
+  injuryDate: string;
+}) {
+  const deadline = calculateDeadline(timing, injuryDate);
+  const overdue = deadline ? isOverdue(deadline) : false;
+  const dueSoon = deadline ? isDueSoon(deadline) : false;
   const isUrgent =
     timing.toLowerCase().includes("immediately") ||
     timing.toLowerCase().includes("within 24 hours");
+
   return (
     <span
       className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full ${
-        isUrgent
+        overdue
+          ? "bg-red-100 text-red-800"
+          : dueSoon
+          ? "bg-amber-50 text-amber-700"
+          : isUrgent
           ? "bg-red-50 text-red-700"
           : "bg-warm-100 text-warm-600"
       }`}
@@ -94,35 +121,256 @@ function TimingBadge({ timing }: { timing: string }) {
           d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
         />
       </svg>
-      {timing}
+      {deadline
+        ? overdue
+          ? `Overdue (was ${deadline.label})`
+          : `Due by ${deadline.label}`
+        : timing}
     </span>
   );
 }
 
+// ──────────────────────────────────────────────
+// Edit Modal
+// ──────────────────────────────────────────────
+function EditModal({
+  incident,
+  onSave,
+  onClose,
+}: {
+  incident: Incident;
+  onSave: (updated: Incident) => void;
+  onClose: () => void;
+}) {
+  const [employeeName, setEmployeeName] = useState(incident.employeeName);
+  const [dateOfInjury, setDateOfInjury] = useState(incident.dateOfInjury);
+  const [injuryType, setInjuryType] = useState<InjuryType>(
+    incident.injuryType
+  );
+  const [severity, setSeverity] = useState<Severity>(incident.severity);
+  const [description, setDescription] = useState(incident.description);
+
+  const severityChanged = severity !== incident.severity;
+  const injuryTypeChanged = injuryType !== incident.injuryType;
+
+  function handleSave() {
+    const needsRegeneration = severityChanged || injuryTypeChanged;
+
+    let steps = incident.steps;
+    if (needsRegeneration) {
+      const newSteps = generateWorkflow({ severity, injuryType });
+      // Preserve completion state for steps that still exist (matched by title)
+      steps = newSteps.map((newStep) => {
+        const oldStep = incident.steps.find((s) => s.title === newStep.title);
+        if (oldStep) {
+          return {
+            ...newStep,
+            completed: oldStep.completed,
+            completedAt: oldStep.completedAt,
+          };
+        }
+        return newStep;
+      });
+    }
+
+    const allCompleted = steps.every((s) => s.completed);
+    const anyCompleted = steps.some((s) => s.completed);
+
+    const updated: Incident = {
+      ...incident,
+      employeeName: employeeName.trim(),
+      dateOfInjury,
+      injuryType,
+      severity,
+      description: description.trim(),
+      steps,
+      status: allCompleted
+        ? "completed"
+        : anyCompleted
+        ? "in_progress"
+        : "new",
+    };
+
+    onSave(updated);
+  }
+
+  const canSave = employeeName.trim() && dateOfInjury && description.trim().length >= 10;
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+        <div className="p-6 border-b border-warm-200">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-bold text-warm-900">Edit Incident</h3>
+            <button
+              onClick={onClose}
+              className="w-8 h-8 rounded-lg hover:bg-warm-100 flex items-center justify-center transition-colors"
+            >
+              <svg
+                className="w-5 h-5 text-warm-500"
+                fill="none"
+                viewBox="0 0 24 24"
+                strokeWidth={2}
+                stroke="currentColor"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M6 18 18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div className="p-6 space-y-5">
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1.5">
+              Employee Name
+            </label>
+            <input
+              type="text"
+              value={employeeName}
+              onChange={(e) => setEmployeeName(e.target.value)}
+              className="w-full px-4 py-2.5 rounded-xl border border-warm-200 bg-warm-50 text-warm-900 focus:outline-none focus:ring-2 focus:ring-sage-500/30 focus:border-sage-500 transition"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1.5">
+              Date of Injury
+            </label>
+            <input
+              type="date"
+              value={dateOfInjury}
+              onChange={(e) => setDateOfInjury(e.target.value)}
+              max={new Date().toISOString().split("T")[0]}
+              className="w-full px-4 py-2.5 rounded-xl border border-warm-200 bg-warm-50 text-warm-900 focus:outline-none focus:ring-2 focus:ring-sage-500/30 focus:border-sage-500 transition"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1.5">
+              Injury Type
+            </label>
+            <select
+              value={injuryType}
+              onChange={(e) => setInjuryType(e.target.value as InjuryType)}
+              className="w-full px-4 py-2.5 rounded-xl border border-warm-200 bg-warm-50 text-warm-900 focus:outline-none focus:ring-2 focus:ring-sage-500/30 focus:border-sage-500 transition"
+            >
+              {Object.entries(INJURY_TYPE_LABELS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1.5">
+              Severity
+            </label>
+            <div className="flex gap-3">
+              {(["minor", "moderate", "severe"] as Severity[]).map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setSeverity(s)}
+                  className={`flex-1 py-2.5 rounded-xl border-2 text-sm font-medium capitalize transition-all ${
+                    severity === s
+                      ? "border-sage-500 bg-sage-50 text-sage-800"
+                      : "border-warm-200 bg-warm-50 text-warm-600 hover:border-warm-300"
+                  }`}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+            {(severityChanged || injuryTypeChanged) && (
+              <p className="text-xs text-amber-600 mt-2">
+                Changing severity or injury type will regenerate the action plan.
+                Completed steps with matching titles will keep their status.
+              </p>
+            )}
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-warm-700 mb-1.5">
+              Description
+            </label>
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              rows={4}
+              className="w-full px-4 py-2.5 rounded-xl border border-warm-200 bg-warm-50 text-warm-900 focus:outline-none focus:ring-2 focus:ring-sage-500/30 focus:border-sage-500 transition resize-none"
+            />
+          </div>
+        </div>
+
+        <div className="p-6 border-t border-warm-200 flex justify-end gap-3">
+          <button
+            onClick={onClose}
+            className="px-5 py-2.5 rounded-xl text-warm-600 font-medium hover:bg-warm-100 transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={!canSave}
+            className="px-5 py-2.5 rounded-xl bg-sage-500 text-white font-medium hover:bg-sage-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────
+// Main Page
+// ──────────────────────────────────────────────
 export default function IncidentDetailPage({
   params,
 }: {
   params: Promise<{ id: string }>;
 }) {
   const { id } = use(params);
-  const router = useRouter();
   const [incident, setIncident] = useState<Incident | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
+  const [showEditModal, setShowEditModal] = useState(false);
+
+  // Undo toast state
+  const [undoToast, setUndoToast] = useState<{
+    message: string;
+    previousIncident: Incident;
+  } | null>(null);
 
   useEffect(() => {
     const inc = getIncident(id);
     if (inc) {
       setIncident(inc);
-      // Auto-expand the first incomplete step
       const firstIncomplete = inc.steps.find((s) => !s.completed);
       if (firstIncomplete) setExpandedStep(firstIncomplete.id);
     }
     setLoaded(true);
   }, [id]);
 
+  const handleUndo = useCallback(() => {
+    if (!undoToast) return;
+    updateIncident(undoToast.previousIncident);
+    setIncident(undoToast.previousIncident);
+    setUndoToast(null);
+  }, [undoToast]);
+
+  const handleDismissToast = useCallback(() => {
+    setUndoToast(null);
+  }, []);
+
   function toggleStep(stepId: string) {
     if (!incident) return;
+
+    // Save current state for undo
+    const previousIncident = { ...incident, steps: [...incident.steps] };
+
+    const toggledStep = incident.steps.find((s) => s.id === stepId);
+    const willComplete = toggledStep && !toggledStep.completed;
 
     const updatedSteps = incident.steps.map((s) => {
       if (s.id === stepId) {
@@ -150,6 +398,24 @@ export default function IncidentDetailPage({
 
     updateIncident(updated);
     setIncident(updated);
+
+    const stepTitle = toggledStep?.title || "Step";
+    setUndoToast({
+      message: willComplete
+        ? `"${stepTitle}" marked complete`
+        : `"${stepTitle}" marked incomplete`,
+      previousIncident,
+    });
+  }
+
+  function handleEditSave(updated: Incident) {
+    updateIncident(updated);
+    setIncident(updated);
+    setShowEditModal(false);
+  }
+
+  function handlePrint() {
+    window.print();
   }
 
   function toggleExpand(stepId: string) {
@@ -191,10 +457,21 @@ export default function IncidentDetailPage({
 
   return (
     <div>
+      {/* Print-only styles */}
+      <style>{`
+        @media print {
+          header, footer, .no-print { display: none !important; }
+          body { background: white !important; }
+          main { padding: 0 !important; max-width: 100% !important; }
+          .print-expand { display: block !important; }
+          .print-break { page-break-inside: avoid; }
+        }
+      `}</style>
+
       {/* Back link */}
       <a
         href="/"
-        className="inline-flex items-center gap-1.5 text-sm text-warm-500 hover:text-sage-600 transition-colors mb-6"
+        className="no-print inline-flex items-center gap-1.5 text-sm text-warm-500 hover:text-sage-600 transition-colors mb-6"
       >
         <svg
           className="w-4 h-4"
@@ -219,11 +496,13 @@ export default function IncidentDetailPage({
             <h2 className="text-2xl font-bold text-warm-900 mb-1">
               {incident.employeeName}
             </h2>
-            <div className="flex items-center gap-3 text-sm text-warm-500">
+            <div className="flex items-center gap-3 text-sm text-warm-500 flex-wrap">
               <span>{INJURY_TYPE_LABELS[incident.injuryType]}</span>
               <span className="text-warm-300">·</span>
               <span>
-                {new Date(incident.dateOfInjury + "T00:00:00").toLocaleDateString("en-US", {
+                {new Date(
+                  incident.dateOfInjury + "T00:00:00"
+                ).toLocaleDateString("en-US", {
                   month: "long",
                   day: "numeric",
                   year: "numeric",
@@ -233,7 +512,9 @@ export default function IncidentDetailPage({
               <span className="capitalize">{incident.severity} severity</span>
             </div>
           </div>
-          <StatusBadge status={incident.status} />
+          <div className="flex items-center gap-2">
+            <StatusBadge status={incident.status} />
+          </div>
         </div>
 
         {/* Description */}
@@ -242,7 +523,7 @@ export default function IncidentDetailPage({
         </p>
 
         {/* Progress */}
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-4 mb-4">
           <div className="flex-1 h-2 bg-warm-100 rounded-full overflow-hidden">
             <div
               className="h-full bg-sage-500 rounded-full transition-all duration-500"
@@ -252,6 +533,48 @@ export default function IncidentDetailPage({
           <span className="text-sm font-medium text-warm-600 whitespace-nowrap">
             {completedCount} of {incident.steps.length} complete
           </span>
+        </div>
+
+        {/* Action buttons */}
+        <div className="no-print flex items-center gap-3">
+          <button
+            onClick={() => setShowEditModal(true)}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-warm-200 text-sm font-medium text-warm-700 hover:bg-warm-50 transition-colors"
+          >
+            <svg
+              className="w-4 h-4"
+              fill="none"
+              viewBox="0 0 24 24"
+              strokeWidth={2}
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.932-8.931Zm0 0L19.5 7.125M18 14v4.75A2.25 2.25 0 0 1 15.75 21H5.25A2.25 2.25 0 0 1 3 18.75V8.25A2.25 2.25 0 0 1 5.25 6H10"
+              />
+            </svg>
+            Edit
+          </button>
+          <button
+            onClick={handlePrint}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-warm-200 text-sm font-medium text-warm-700 hover:bg-warm-50 transition-colors"
+          >
+            <svg
+              className="w-4 h-4"
+              fill="none"
+              viewBox="0 0 24 24"
+              strokeWidth={2}
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M6.72 13.829c-.24.03-.48.062-.72.096m.72-.096a42.415 42.415 0 0 1 10.56 0m-10.56 0L6.34 18m10.94-4.171c.24.03.48.062.72.096m-.72-.096L17.66 18m0 0 .229 2.523a1.125 1.125 0 0 1-1.12 1.227H7.231c-.662 0-1.18-.568-1.12-1.227L6.34 18m11.318 0h1.091A2.25 2.25 0 0 0 21 15.75V9.456c0-1.081-.768-2.015-1.837-2.175a48.055 48.055 0 0 0-1.913-.247M6.34 18H5.25A2.25 2.25 0 0 1 3 15.75V9.456c0-1.081.768-2.015 1.837-2.175a48.041 48.041 0 0 1 1.913-.247m10.5 0a48.536 48.536 0 0 0-10.5 0m10.5 0V3.375c0-.621-.504-1.125-1.125-1.125h-8.25c-.621 0-1.125.504-1.125 1.125v3.659M18 10.5h.008v.008H18V10.5Zm-3 0h.008v.008H15V10.5Z"
+              />
+            </svg>
+            Print Action Plan
+          </button>
         </div>
 
         {incident.status === "completed" && (
@@ -295,20 +618,20 @@ export default function IncidentDetailPage({
             return (
               <div
                 key={step.id}
-                className={`bg-white rounded-2xl border shadow-sm transition-all ${
+                className={`print-break bg-white rounded-2xl border shadow-sm transition-all ${
                   step.completed
                     ? "border-sage-200 bg-sage-50/30"
                     : "border-warm-200"
                 }`}
               >
-                {/* Step header — clickable to expand */}
+                {/* Step header */}
                 <button
                   onClick={() => toggleExpand(step.id)}
                   className="w-full flex items-start gap-4 p-5 text-left"
                 >
                   {/* Checkbox */}
                   <label
-                    className="shrink-0 mt-0.5"
+                    className="no-print shrink-0 mt-0.5"
                     onClick={(e) => e.stopPropagation()}
                   >
                     <input
@@ -344,11 +667,14 @@ export default function IncidentDetailPage({
 
                   {/* Step info */}
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
                       <span className="text-xs font-medium text-warm-400">
                         Step {index + 1}
                       </span>
-                      <TimingBadge timing={step.timing} />
+                      <TimingBadge
+                        timing={step.timing}
+                        injuryDate={incident.dateOfInjury}
+                      />
                     </div>
                     <h4
                       className={`font-semibold transition-colors ${
@@ -374,7 +700,7 @@ export default function IncidentDetailPage({
 
                   {/* Expand indicator */}
                   <svg
-                    className={`w-5 h-5 text-warm-400 shrink-0 transition-transform ${
+                    className={`no-print w-5 h-5 text-warm-400 shrink-0 transition-transform ${
                       isExpanded ? "rotate-180" : ""
                     }`}
                     fill="none"
@@ -390,47 +716,49 @@ export default function IncidentDetailPage({
                   </svg>
                 </button>
 
-                {/* Expanded content */}
-                {isExpanded && (
-                  <div className="px-5 pb-5 pl-15 border-t border-warm-100">
-                    <div className="pt-4 pl-10 space-y-4">
-                      <p className="text-sm text-warm-700 leading-relaxed">
-                        {step.description}
+                {/* Expanded content — always visible in print */}
+                <div
+                  className={`px-5 pb-5 pl-15 border-t border-warm-100 ${
+                    isExpanded ? "" : "hidden print-expand"
+                  }`}
+                >
+                  <div className="pt-4 pl-10 space-y-4">
+                    <p className="text-sm text-warm-700 leading-relaxed">
+                      {step.description}
+                    </p>
+                    <div className="p-3 rounded-lg bg-sage-50 border border-sage-100">
+                      <p className="text-xs font-semibold text-sage-700 mb-1">
+                        Why this matters
                       </p>
-                      <div className="p-3 rounded-lg bg-sage-50 border border-sage-100">
-                        <p className="text-xs font-semibold text-sage-700 mb-1">
-                          Why this matters
-                        </p>
-                        <p className="text-sm text-sage-800 leading-relaxed">
-                          {step.whyItMatters}
-                        </p>
-                      </div>
-                      {step.officialLink && (
-                        <a
-                          href={step.officialLink.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 text-sm text-sage-600 hover:text-sage-700 font-medium"
-                        >
-                          {step.officialLink.label}
-                          <svg
-                            className="w-3.5 h-3.5"
-                            fill="none"
-                            viewBox="0 0 24 24"
-                            strokeWidth={2}
-                            stroke="currentColor"
-                          >
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              d="M13.5 6H5.25A2.25 2.25 0 0 0 3 8.25v10.5A2.25 2.25 0 0 0 5.25 21h10.5A2.25 2.25 0 0 0 18 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
-                            />
-                          </svg>
-                        </a>
-                      )}
+                      <p className="text-sm text-sage-800 leading-relaxed">
+                        {step.whyItMatters}
+                      </p>
                     </div>
+                    {step.officialLink && (
+                      <a
+                        href={step.officialLink.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 text-sm text-sage-600 hover:text-sage-700 font-medium"
+                      >
+                        {step.officialLink.label}
+                        <svg
+                          className="w-3.5 h-3.5"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          strokeWidth={2}
+                          stroke="currentColor"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M13.5 6H5.25A2.25 2.25 0 0 0 3 8.25v10.5A2.25 2.25 0 0 0 5.25 21h10.5A2.25 2.25 0 0 0 18 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
+                          />
+                        </svg>
+                      </a>
+                    )}
                   </div>
-                )}
+                </div>
               </div>
             );
           })}
@@ -438,7 +766,7 @@ export default function IncidentDetailPage({
 
         {/* Sidebar */}
         <div className="space-y-6">
-          {/* Timeline summary */}
+          {/* Timeline summary with deadlines */}
           <div className="bg-white rounded-2xl border border-warm-200 shadow-sm p-6">
             <h3 className="text-sm font-semibold text-warm-700 uppercase tracking-wider mb-4">
               Timeline
@@ -446,17 +774,38 @@ export default function IncidentDetailPage({
             <ul className="space-y-3">
               {incident.steps
                 .filter((s) => !s.completed)
-                .map((step) => (
-                  <li key={step.id} className="flex items-start gap-3">
-                    <div className="w-2 h-2 rounded-full bg-warm-300 mt-1.5 shrink-0" />
-                    <div>
-                      <p className="text-sm text-warm-700 font-medium leading-tight">
-                        {step.title}
-                      </p>
-                      <p className="text-xs text-warm-500">{step.timing}</p>
-                    </div>
-                  </li>
-                ))}
+                .map((step) => {
+                  const deadline = calculateDeadline(
+                    step.timing,
+                    incident.dateOfInjury
+                  );
+                  const overdue = deadline ? isOverdue(deadline) : false;
+                  return (
+                    <li key={step.id} className="flex items-start gap-3">
+                      <div
+                        className={`w-2 h-2 rounded-full mt-1.5 shrink-0 ${
+                          overdue ? "bg-red-500" : "bg-warm-300"
+                        }`}
+                      />
+                      <div>
+                        <p className="text-sm text-warm-700 font-medium leading-tight">
+                          {step.title}
+                        </p>
+                        <p
+                          className={`text-xs ${
+                            overdue ? "text-red-600 font-medium" : "text-warm-500"
+                          }`}
+                        >
+                          {deadline
+                            ? overdue
+                              ? `Overdue — was due ${deadline.label}`
+                              : `Due by ${deadline.label}`
+                            : step.timing}
+                        </p>
+                      </div>
+                    </li>
+                  );
+                })}
               {incident.steps.filter((s) => !s.completed).length === 0 && (
                 <li className="text-sm text-sage-600 font-medium">
                   All tasks completed!
@@ -498,6 +847,24 @@ export default function IncidentDetailPage({
           <ResourcePanel />
         </div>
       </div>
+
+      {/* Edit Modal */}
+      {showEditModal && (
+        <EditModal
+          incident={incident}
+          onSave={handleEditSave}
+          onClose={() => setShowEditModal(false)}
+        />
+      )}
+
+      {/* Undo Toast */}
+      {undoToast && (
+        <UndoToast
+          message={undoToast.message}
+          onUndo={handleUndo}
+          onDismiss={handleDismissToast}
+        />
+      )}
     </div>
   );
 }
